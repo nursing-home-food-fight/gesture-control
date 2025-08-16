@@ -7,7 +7,7 @@ from typing import Any, Final, Optional
 
 # --- Arduino & Serial Config ---
 # ❗️ IMPORTANT: Update this to your Arduino's port
-ARDUINO_PORT: Final[str] = '/dev/cu.usbmodem2101'
+ARDUINO_PORT: Final[str] = 'COM3'
 BAUD_RATE: Final[int] = 9600
 PIN_TO_CONTROL: Final[int] = 8
 

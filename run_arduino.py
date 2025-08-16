@@ -6,7 +6,7 @@ import time
 
 # --- IMPORTANT ---
 # The port has been updated as you requested.
-ARDUINO_PORT = '/dev/cu.usbmodem2101'
+ARDUINO_PORT = 'COM3'
 BAUD_RATE = 9600
 
 try:

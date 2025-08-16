@@ -2,7 +2,7 @@ import serial
 import time
 
 # --- Configuration Section ---
-ARDUINO_PORT = '/dev/cu.usbmodem2101'
+ARDUINO_PORT = 'COM3'
 BAUD_RATE = 9600
 
 try:
@@ -13,14 +13,23 @@ try:
 
     while True:
         # Get user input
-        pin = input("Enter pin number to control (e.g., 8) or 'quit' to exit: ")
+        pin = input("Enter PWM-capable pin number (e.g., 3, 5, 6, 9, 10, 11) or 'quit' to exit: ")
         if pin.lower() == 'quit':
             break
             
-        state = input("Enter state (1 for ON, 0 for OFF): ")
+        value = input("Enter analog value (0.0 to 1.0, where 0.0 is OFF and 1.0 is full intensity): ")
+        
+        # Validate the input
+        try:
+            float_value = float(value)
+            if float_value < 0.0 or float_value > 1.0:
+                print("Warning: Value should be between 0.0 and 1.0. It will be constrained.")
+        except ValueError:
+            print("Error: Please enter a valid number between 0.0 and 1.0")
+            continue
 
-        # Create the command string in the "pin,state" format
-        command = f"{pin},{state}\n" # The '\n' is important!
+        # Create the command string in the "pin,value" format
+        command = f"{pin},{value}\n" # The '\n' is important!
 
         # Send the command to the Arduino
         arduino.write(command.encode('utf-8'))
