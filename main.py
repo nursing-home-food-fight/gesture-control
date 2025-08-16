@@ -3,6 +3,8 @@ import mediapipe as mp
 from typing import Any, Final, Tuple
 import numpy as np
 from numpy.typing import NDArray
+import serial
+import time
 
 mp_hands: Any = mp.solutions.hands
 mp_drawing: Any = mp.solutions.drawing_utils
@@ -13,14 +15,41 @@ FRAME_WIDTH: Final[int] = 1280
 FRAME_HEIGHT: Final[int] = 720
 CIRCLE_COLOR: Final[Tuple[int, int, int]] = (0, 0, 255)   # red
 
+ARDUINO_PORT = '/dev/cu.usbmodem2101'
+BAUD_RATE = 9600
+CONTROL_PIN = '8'
+
+arduino = serial.Serial(port=ARDUINO_PORT, baudrate=BAUD_RATE, timeout=.1)
+state = '0'
+
 
 # --- Helpers ---
 
 def draw_circle(img: NDArray[np.uint8]) -> None:
+    global state
     h, w = img.shape[:2]
     radius = int(min(w, h) * 0.18)  # larger radius
     thickness = 18  # thicker
     cv2.circle(img, (w // 2, h // 2), radius, CIRCLE_COLOR, thickness=thickness)
+
+    if state == '0':
+        state = '1'
+    else:
+        state = '0'
+
+    # Create the command string in the "pin,state" format
+    command = f"{CONTROL_PIN},{state}\n" # The '\n' is important!
+
+    # Send the command to the Arduino
+    arduino.write(command.encode('utf-8'))
+    print(f"Sent command: {command.strip()}")
+    
+    # Wait a moment and read the confirmation from Arduino
+    time.sleep(0.1)
+    response = arduino.readline().decode('utf-8').strip()
+    if response:
+        print(f"Arduino response: {response}")
+    print("-" * 20)
 
 def is_fist(hand_lms: Any) -> bool:
     # Simple fist detection: all fingertips close to palm
