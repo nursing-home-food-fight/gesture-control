@@ -15,6 +15,8 @@ FRAME_WIDTH: Final[int] = 1280
 FRAME_HEIGHT: Final[int] = 720
 CIRCLE_COLOR: Final[Tuple[int, int, int]] = (0, 0, 255)   # red
 
+CHOP_THRESHOLD: Final[float] = 0.5  # Minimum vertical movement to be considered a chop
+
 # Check for "--no-arduino" command line argument
 USE_ARDUINO = "--no-arduino" not in sys.argv
 
@@ -77,6 +79,7 @@ def send_signal(pin: str, value: float) -> None:
             return
     
     try:
+        # Always send the command, threshold is now handled in the main loop
         command = f"{pin},{value}\n"
         arduino_connection.write(command.encode('utf-8'))
         print(f"Sent to Arduino: {command.strip()}")
@@ -114,27 +117,45 @@ def draw_circle(img: Any, intensity: float = 1.0) -> None:
     
     cv2.circle(img, (w // 2, h // 2), radius, intensity_color, thickness=thickness)
 
-def get_fist_closedness(hand_lms: Any) -> Tuple[bool, float]:
-    # Detect fist and measure how closed it is
-    # Indices: 0=wrist, 4=thumb_tip, 8=index_tip, 12=middle_tip, 16=ring_tip, 20=pinky_tip
-    tips = [4, 8, 12, 16, 20]
-    palm = hand_lms.landmark[0]
-    closed = 0
-    total_dist = 0
-    max_dist = 0.25  # Maximum expected distance
+def detect_vertical_position(hand_lms: Any, prev_hand_positions: list) -> Tuple[bool, float]:
+    """
+    Tracks the vertical position of the hand and calculates the change in position.
+    Only detects DOWNWARD motion (increasing Y value in the image).
     
-    for tip_idx in tips:
-        tip = hand_lms.landmark[tip_idx]
-        dist = ((tip.x - palm.x) ** 2 + (tip.y - palm.y) ** 2) ** 0.5
-        total_dist += dist
-        if dist < 0.18:
-            closed += 1
+    Returns: (movement_detected, position_change) where position_change is a value between 0 and 1
+    representing how much the hand has moved downward
+    """
+    # Get wrist landmark for tracking position
+    wrist = hand_lms.landmark[0]
     
-    # Calculate closedness as a value between 0 and 1
-    # Lower total_dist means more closed fist
-    closedness = max(0.0, min(1.0, 1.0 - (total_dist / (len(tips) * max_dist))))
+    # Default values
+    movement_detected = False
+    position_change = 0.0
     
-    return closed >= 3, closedness
+    # We need at least one previous position to calculate change
+    if prev_hand_positions:
+        prev_wrist_y = prev_hand_positions[-1]
+        
+        # Calculate vertical movement (positive means moving down in image coordinates)
+        vertical_change = wrist.y - prev_wrist_y
+        
+        # Only consider downward movement (increasing Y)
+        if vertical_change > 0:
+            # Normalize the change to a 0-1 range
+            # 0.005 would be a small movement, 0.05+ would be a large movement
+            position_change = min(1.0, vertical_change / 0.05)
+            
+            # Consider any significant downward movement
+            if position_change > 0.05:
+                movement_detected = True
+    
+    # Update position history
+    prev_hand_positions.append(wrist.y)
+    # Keep only the last 5 positions
+    if len(prev_hand_positions) > 5:
+        prev_hand_positions.pop(0)
+    
+    return movement_detected, position_change
 
 cv2.destroyAllWindows()
 cap = cv2.VideoCapture(0)
@@ -165,6 +186,12 @@ with mp_hands.Hands(
     min_detection_confidence=0.6,
     min_tracking_confidence=0.5,
 ) as hands:
+    # Variables for chop motion tracking
+    prev_hand_positions = []
+    last_chop_time = 0
+    current_signal_value = 0.0
+    signal_hold_duration = 1.0  # Hold the signal for 1 second
+    
     while True:
         ret, webcam_frame = cap.read()
         if not ret:
@@ -174,8 +201,14 @@ with mp_hands.Hands(
         frame = webcam_frame.copy()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
-        fist_detected = False
-        closedness = 0.0
+        
+        # Check if we should reset the signal after hold duration
+        current_time = time.time()
+        signal_expired = (current_time - last_chop_time) > signal_hold_duration
+        
+        chop_detected = False
+        chop_speed = 0.0
+        
         if results.multi_hand_landmarks:
             for hand_lms in results.multi_hand_landmarks:
                 mp_drawing.draw_landmarks(
@@ -185,36 +218,46 @@ with mp_hands.Hands(
                     mp_styles.get_default_hand_landmarks_style(),
                     mp_styles.get_default_hand_connections_style()
                 )
-                is_fist, fist_closedness = get_fist_closedness(hand_lms)
-                if is_fist:
-                    fist_detected = True
-                    closedness = max(closedness, fist_closedness)  # Take the highest closedness if multiple hands
+                movement_detected, position_change = detect_vertical_position(hand_lms, prev_hand_positions)
+                if movement_detected:
+                    chop_detected = True
+                    chop_speed = max(chop_speed, position_change)  # Take the highest change if multiple hands
+                    # Update signal value and reset timer when movement exceeds threshold
+                    if position_change > CHOP_THRESHOLD:
+                        current_signal_value = position_change
+                        last_chop_time = current_time
         
         # Throttle rate of sending signals to avoid flooding Arduino
-        should_send_signal = int(time.time() * 5) % 2 == 0  # Send updates at reduced rate (every ~0.4 seconds)
+        should_send_signal = int(current_time * 5) % 2 == 0  # Send updates at reduced rate (every ~0.4 seconds)
         
-        # Visualize and send the closedness value if fist detected
-        if fist_detected:
-            draw_circle(frame, closedness)
+        # If signal has expired, reset the value to 0.0
+        # This will turn off the LED after the hold duration
+        if signal_expired:
+            current_signal_value = 0.0
+        
+        # Visualize the current signal value
+        draw_circle(frame, current_signal_value)
+        
+        if should_send_signal:
+            send_signal(CONTROL_PIN, current_signal_value)
+        
+        # Display status messages based on current state
+        if current_signal_value > 0:
+            cv2.putText(frame, f'Downward movement intensity: {current_signal_value:.2f}', (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
             
-            if should_send_signal:
-                send_signal(CONTROL_PIN, closedness)
-            
-            # Display the closedness value on screen
-            cv2.putText(frame, f'Fist closedness: {closedness:.2f}', (20, 80),
+            # Show countdown for how long the signal will remain
+            if not chop_detected:  # Only show countdown when not actively moving
+                time_left = max(0.0, signal_hold_duration - (current_time - last_chop_time))
+                cv2.putText(frame, f'Signal hold: {time_left:.1f}s', (20, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+        else:
+            cv2.putText(frame, 'No downward movement detected - LED OFF', (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         
-        # If no fist is detected, turn off the LED
-        elif should_send_signal:
-            send_signal(CONTROL_PIN, 0.0)
-            
-            # Add a status message
-            cv2.putText(frame, 'No fist detected - LED OFF', (20, 80),
+        cv2.putText(frame, f'Move your hand DOWNWARD to control LED (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-            
-        cv2.putText(frame, 'Make a fist to control intensity. Tighter fist = higher value.', (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        cv2.putText(frame, 'Circle size, color, and thickness all reflect intensity. Press x to exit.', (20, 120),
+        cv2.putText(frame, 'Downward movement above threshold = LED on for 1 second. Press x to exit.', (20, 160),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         cv2.imshow('Gesture Circle', frame.astype(np.uint8))
         if (cv2.waitKey(1) & 0xFF) == ord('x'):
