@@ -256,7 +256,8 @@ with mp_hands.Hands(
     prev_hand_positions = []
     last_chop_time = 0
     current_signal_value = 0.0
-    signal_hold_duration = 1.0  # Hold the signal for 1 second
+    signal_hold_duration = 0.1  # Hold the signal for just 0.1 seconds (much shorter)
+    last_signal_time = 0  # Track when we last sent a signal to avoid flooding
     
     while True:
         ret, webcam_frame = cap.read()
@@ -293,9 +294,6 @@ with mp_hands.Hands(
                         current_signal_value = position_change
                         last_chop_time = current_time
         
-        # Throttle rate of sending signals to avoid flooding Arduino
-        should_send_signal = int(current_time * 5) % 2 == 0  # Send updates at reduced rate (every ~0.4 seconds)
-        
         # If signal has expired, reset the value to 0.0
         if signal_expired:
             current_signal_value = 0.0
@@ -304,15 +302,16 @@ with mp_hands.Hands(
         draw_circle(frame, current_signal_value)
         
         # Only attempt to send signals if we're not in display-only mode
-        if should_send_signal and USE_ARDUINO:
-            # Throttle signal sending to not flood the connection
-            # Send signal to the servo controller if the value exceeds the threshold
-            if current_signal_value > CHOP_THRESHOLD:
+        if USE_ARDUINO and current_signal_value > CHOP_THRESHOLD:
+            # Limit how often we send signals to avoid flooding the Arduino
+            # Only send a new signal if it's been more than 0.5 seconds since the last one
+            if current_time - last_signal_time > 0.5:
                 send_signal("", current_signal_value, is_servo=True)
+                last_signal_time = current_time  # Update the last signal time
                 
-                # Only send it once when we exceed the threshold to avoid
-                # triggering the servo repeatedly
-                current_signal_value = 0.0
+                # Reset the signal immediately after sending to prevent rapid repeats
+                # but keep visual feedback in the UI
+                # current_signal_value = 0.0  # Uncomment to reset signal immediately
         
         # Display status messages based on current state
         if current_signal_value > 0:

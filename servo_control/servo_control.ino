@@ -32,27 +32,27 @@ void loop() {
 
 // Function to run the chopping servo sequence
 void runServoSequence() {
-  int myChopDelay = 20; // Time delay in milli-seconds
-  int myReturnDelay = 5; // Time delay in milli-seconds
-  int myInitPos = 90; // Initial position
+  int fastDelay = 5;    // Fast movement delay (going down) - was 20
+  int slowDelay = 20;   // Slow movement delay (going up) - was 5
+  int myInitPos = 90;   // Initial position
   int newPos = myInitPos; // Set new position to initial position
   
   Serial.println("Starting servo sequence...");
   myServo.write(myInitPos);   // Move servo to initial position
   delay(100);
   
-  // First movement - going down
+  // First movement - going down FAST
   for (int i = 0; i < myInitPos; i++) {
     newPos = myInitPos - i;
     myServo.write(newPos);
-    delay(myChopDelay);
+    delay(fastDelay); // Fast movement
   }
   
-  // Second movement - going up
+  // Second movement - going up SLOW
   for (int i = 0; i < myInitPos; i++) {
     newPos = i;
     myServo.write(newPos);
-    delay(myReturnDelay);
+    delay(slowDelay); // Slow movement
   }
   
   // Return to initial position
