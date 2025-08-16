@@ -17,6 +17,83 @@ CIRCLE_COLOR: Final[Tuple[int, int, int]] = (0, 0, 255)   # red
 
 CHOP_THRESHOLD: Final[float] = 0.5  # Minimum vertical movement to be considered a chop
 
+# --- Smoothing Config ---
+SMOOTHING_FACTOR: Final[float] = 0.5  # 0 = no smoothing, 1 = maximum smoothing
+HAND_TIMEOUT: Final[float] = 2.0  # Seconds to keep using last known hand position
+USE_SMOOTHING: Final[bool] = True  # Enable or disable smoothing
+
+
+# --- Hand Tracking with Smoothing ---
+class HandTracker:
+    def __init__(self, smoothing_factor: float = SMOOTHING_FACTOR):
+        """
+        Initialize the hand tracker with smoothing.
+        
+        Args:
+            smoothing_factor: 0 = no smoothing, 1 = maximum smoothing (0.5 is good default)
+        """
+        self.smoothing_factor = max(0.0, min(1.0, smoothing_factor))  # Clamp between 0 and 1
+        self.last_hand_lms = None  # Last detected hand landmarks
+        self.smooth_hand_lms = None  # Smoothed hand landmarks
+        self.last_detection_time = time.time()  # When the hand was last detected
+        self.hand_visible = False  # Whether hand is currently visible
+        self.prev_positions = []  # Store previous wrist Y positions
+        
+    def update(self, hand_landmarks):
+        """Update with new hand landmarks."""
+        self.hand_visible = True
+        self.last_detection_time = time.time()
+        
+        # Store raw landmarks
+        self.last_hand_lms = hand_landmarks
+        
+        # Apply smoothing if we have previous data
+        if self.smooth_hand_lms is None:
+            # First detection, no smoothing possible yet
+            self.smooth_hand_lms = hand_landmarks
+        else:
+            # Apply smoothing to each landmark
+            for i, landmark in enumerate(hand_landmarks.landmark):
+                smooth_landmark = self.smooth_hand_lms.landmark[i]
+                # Smooth x, y, z coordinates
+                smooth_landmark.x = self._smooth_value(smooth_landmark.x, landmark.x)
+                smooth_landmark.y = self._smooth_value(smooth_landmark.y, landmark.y)
+                smooth_landmark.z = self._smooth_value(smooth_landmark.z, landmark.z)
+        
+        return self.smooth_hand_lms
+    
+    def _smooth_value(self, prev_value: float, new_value: float) -> float:
+        """Apply smoothing between previous and new values."""
+        if not USE_SMOOTHING:
+            return new_value  # No smoothing
+        return prev_value * self.smoothing_factor + new_value * (1 - self.smoothing_factor)
+    
+    def get_landmarks(self):
+        """
+        Get the current hand landmarks.
+        
+        Returns:
+            Hand landmarks if hand is visible or within timeout period, None otherwise.
+        """
+        # If hand is currently visible, use the smoothed landmarks
+        if self.hand_visible:
+            return self.smooth_hand_lms
+        
+        # If within timeout window, use the last known position
+        if time.time() - self.last_detection_time < HAND_TIMEOUT and self.smooth_hand_lms is not None:
+            return self.smooth_hand_lms
+        
+        # No valid landmarks available
+        return None
+    
+    def check_visibility(self):
+        """
+        Update hand visibility status based on timeout.
+        Should be called every frame.
+        """
+        if time.time() - self.last_detection_time > HAND_TIMEOUT:
+            self.hand_visible = False
+
 # Check for "--no-arduino" command line argument
 USE_ARDUINO = "--no-arduino" not in sys.argv
 
@@ -60,7 +137,6 @@ def initialize_arduino():
                 
                 # Clear any initial buffer and don't wait too long
                 start_time = time.time()
-                response_received = False
                 
                 # Try to read any initial message from Arduino
                 while arduino_connection.in_waiting and time.time() - start_time < 2.0:
@@ -68,14 +144,13 @@ def initialize_arduino():
                         line = arduino_connection.readline().decode('utf-8').strip()
                         if line:
                             print(f"Arduino says: {line}")
-                            response_received = True
                     except Exception as e:
                         # If there's an error reading, just clear the buffer
                         print(f"Error reading from Arduino: {e}")
                         try:
                             arduino_connection.reset_input_buffer()
-                        except:
-                            pass
+                        except Exception as e2:
+                            print(f"Failed to reset input buffer: {e2}")
                         break
                 
                 # Return the connection even if we didn't get a response
@@ -252,6 +327,9 @@ with mp_hands.Hands(
     min_detection_confidence=0.6,
     min_tracking_confidence=0.5,
 ) as hands:
+    # Initialize hand tracker with smoothing
+    hand_tracker = HandTracker(SMOOTHING_FACTOR)
+    
     # Variables for chop motion tracking
     prev_hand_positions = []
     last_chop_time = 0
@@ -276,23 +354,42 @@ with mp_hands.Hands(
         chop_detected = False
         chop_speed = 0.0
         
+        # Update hand tracker visibility status
+        hand_tracker.check_visibility()
+        
+        # Process new hand detection
         if results.multi_hand_landmarks:
-            for hand_lms in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_lms,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style()
-                )
-                movement_detected, position_change = detect_vertical_position(hand_lms, prev_hand_positions)
-                if movement_detected:
-                    chop_detected = True
-                    chop_speed = max(chop_speed, position_change)  # Take the highest change if multiple hands
-                    # Update signal value and reset timer when movement exceeds threshold
-                    if position_change > CHOP_THRESHOLD:
-                        current_signal_value = position_change
-                        last_chop_time = current_time
+            # Update the tracker with the first hand detected
+            hand_tracker.update(results.multi_hand_landmarks[0])
+        
+        # Get smoothed hand landmarks (could be current or last known position)
+        smooth_hand_lms = hand_tracker.get_landmarks()
+        
+        if smooth_hand_lms:
+            # Draw the smoothed hand landmarks
+            mp_drawing.draw_landmarks(
+                frame,
+                smooth_hand_lms,
+                mp_hands.HAND_CONNECTIONS,
+                mp_styles.get_default_hand_landmarks_style(),
+                mp_styles.get_default_hand_connections_style()
+            )
+            
+            # Process hand movement using the smoothed hand landmarks
+            movement_detected, position_change = detect_vertical_position(smooth_hand_lms, prev_hand_positions)
+            if movement_detected:
+                chop_detected = True
+                chop_speed = position_change
+                # Update signal value and reset timer when movement exceeds threshold
+                if position_change > CHOP_THRESHOLD:
+                    current_signal_value = position_change
+                    last_chop_time = current_time
+            
+            # Add status indicator for smoothing
+            if not hand_tracker.hand_visible:
+                # If using last known position, display indicator
+                cv2.putText(frame, "Using last known hand position", (frame.shape[1] - 350, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
         
         # If signal has expired, reset the value to 0.0
         if signal_expired:
@@ -328,13 +425,27 @@ with mp_hands.Hands(
                 cv2.putText(frame, f'Signal hold: {time_left:.1f}s', (20, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         else:
-            cv2.putText(frame, 'No downward movement detected - Controls OFF', (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            if smooth_hand_lms:
+                status = "Hand detected - Controls ready" if hand_tracker.hand_visible else "Using last known position"
+                cv2.putText(frame, status, (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            else:
+                cv2.putText(frame, 'No hand detected - Controls OFF', (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         
         cv2.putText(frame, f'Move your hand DOWNWARD to control servo (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         cv2.putText(frame, 'Downward movement above threshold activates servo. Press x to exit.', (20, 160),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+        
+        # Show smoothing information
+        smooth_status = f"Smoothing: {'ON' if USE_SMOOTHING else 'OFF'} (factor: {SMOOTHING_FACTOR:.1f})"
+        timeout_status = f"Hand timeout: {HAND_TIMEOUT:.1f}s"
+        cv2.putText(frame, smooth_status, (20, frame.shape[0] - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, timeout_status, (20, frame.shape[0] - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        
         cv2.imshow('Gesture Circle', frame.astype(np.uint8))
         if (cv2.waitKey(1) & 0xFF) == ord('x'):
             break
