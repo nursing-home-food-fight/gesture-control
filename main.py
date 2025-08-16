@@ -20,11 +20,13 @@ CHOP_THRESHOLD: Final[float] = 0.5  # Minimum vertical movement to be considered
 # Check for "--no-arduino" command line argument
 USE_ARDUINO = "--no-arduino" not in sys.argv
 
-ARDUINO_PORT = 'COM3'
+# Try these ports in order - focus on COM4 since it shows "Access is denied" rather than "not found"
+ARDUINO_PORTS = ['COM4']  # Reduced to just the port that seems to exist but might be busy
 BAUD_RATE = 9600
-CONTROL_PIN = '6'
+SERVO_PIN = '9'  # Pin number for servo on Arduino
 arduino_connection = None  # Global variable to hold the Arduino connection
-led_is_on = False  # Global variable to track if LED is currently on
+RETRY_DELAY = 2  # Seconds to wait between connection attempts
+MAX_RETRIES = 3  # Maximum number of retries before giving up on a reconnect attempt
 
 def initialize_arduino():
     """Establishes a connection to the Arduino and returns the connection object"""
@@ -34,68 +36,119 @@ def initialize_arduino():
     if not USE_ARDUINO:
         print("Arduino usage is disabled. Running in display-only mode.")
         return None
-        
-    try:
-        print(f"Connecting to Arduino on {ARDUINO_PORT}...")
-        arduino_connection = serial.Serial(port=ARDUINO_PORT, baudrate=BAUD_RATE, timeout=0.5)
-        print(f"Connected to Arduino on {ARDUINO_PORT}")
-        time.sleep(1)  # Give the Arduino time to reset, but not too long
-        
-        # Clear any initial buffer and don't wait too long
-        start_time = time.time()
-        while arduino_connection.in_waiting and time.time() - start_time < 1.0:
+    
+    # Try each port in the list until one works
+    for port in ARDUINO_PORTS:
+        for attempt in range(MAX_RETRIES):
             try:
-                line = arduino_connection.readline().decode('utf-8').strip()
-                print(f"Arduino says: {line}")
+                print(f"Connecting to Arduino on {port} (attempt {attempt+1}/{MAX_RETRIES})...")
+                
+                # Close any existing connection first
+                if arduino_connection is not None and arduino_connection.is_open:
+                    try:
+                        arduino_connection.close()
+                        print("Closed previous connection")
+                    except Exception as e:
+                        print(f"Error closing previous connection: {e}")
+                
+                # Try to connect with a longer timeout for stability
+                arduino_connection = serial.Serial(port=port, baudrate=BAUD_RATE, timeout=1.0)
+                print(f"Connected to Arduino on {port}")
+                
+                # Give the Arduino time to reset and initialize
+                time.sleep(2.0)  # Increased wait time
+                
+                # Clear any initial buffer and don't wait too long
+                start_time = time.time()
+                response_received = False
+                
+                # Try to read any initial message from Arduino
+                while arduino_connection.in_waiting and time.time() - start_time < 2.0:
+                    try:
+                        line = arduino_connection.readline().decode('utf-8').strip()
+                        if line:
+                            print(f"Arduino says: {line}")
+                            response_received = True
+                    except Exception as e:
+                        # If there's an error reading, just clear the buffer
+                        print(f"Error reading from Arduino: {e}")
+                        try:
+                            arduino_connection.reset_input_buffer()
+                        except:
+                            pass
+                        break
+                
+                # Return the connection even if we didn't get a response
+                # The Arduino might not be sending anything initially
+                return arduino_connection
+                
+            except serial.SerialException as e:
+                if "PermissionError" in str(e) or "Access is denied" in str(e):
+                    print(f"Port {port} is busy. Waiting {RETRY_DELAY} seconds before retry...")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    print(f"Failed to connect to Arduino on {port}: {e}")
+                    break  # Don't retry on other errors
             except Exception as e:
-                # If there's an error reading, just clear the buffer
-                print(f"Error reading from Arduino: {e}")
-                arduino_connection.reset_input_buffer()
-                break
-        
-        return arduino_connection
-    except Exception as e:
-        print(f"Failed to connect to Arduino: {e}")
-        return None
+                print(f"Unexpected error connecting to Arduino on {port}: {e}")
+                break  # Don't retry on unexpected errors
+    
+    print("Could not connect to Arduino on any available port. Try running with --no-arduino flag if needed.")
+    return None
 
 # --- Helpers ---
 
-def send_signal(pin: str, value: float) -> None:
+def send_signal(pin: str, value: float, is_servo: bool = False) -> None:
     """
     Sends a signal to the Arduino to control a pin.
     
-    Value should be a decimal between 0 and 1
+    Value should be a decimal between 0 and 1.
+    If is_servo=True, sends the value directly without a pin number (for servo_control.ino).
     """
     # Skip if Arduino is disabled
     if not USE_ARDUINO:
         return
         
     global arduino_connection
+    
+    # Only attempt to reconnect once per main loop iteration
+    connection_attempts = 0
+    
+    # If no connection or connection is closed, try to initialize
     if arduino_connection is None or not arduino_connection.is_open:
-        print("No active Arduino connection. Attempting to reconnect...")
-        arduino_connection = initialize_arduino()
+        if connection_attempts < 1:  # Limit reconnection attempts
+            print("No active Arduino connection. Attempting to reconnect...")
+            arduino_connection = initialize_arduino()
+            connection_attempts += 1
+            
         if arduino_connection is None:
             print("Failed to send signal - no Arduino connection")
             return
     
     try:
-        # Always send the command, threshold is now handled in the main loop
-        command = f"{pin},{value}\n"
+        # For servo control, we just send the value directly
+        if is_servo:
+            command = f"{value}\n"
+        else:
+            command = f"{pin},{value}\n"
+            
         arduino_connection.write(command.encode('utf-8'))
         print(f"Sent to Arduino: {command.strip()}")
         
         # Quick check for response (non-blocking)
-        time.sleep(0.05)  # Very brief wait
+        time.sleep(0.1)  # Slightly longer wait
         if arduino_connection.in_waiting:
             # Only try to read for a short time
             response = arduino_connection.read(arduino_connection.in_waiting).decode('utf-8').strip()
             if response:
                 print(f"Arduino response: {response}")
+                
     except Exception as e:
         print(f"Error sending signal to Arduino: {e}")
         # Try to reset the connection next time
         try:
-            arduino_connection.close()
+            if arduino_connection and arduino_connection.is_open:
+                arduino_connection.close()
         except Exception as e2:
             print(f"Error closing Arduino connection: {e2}")
         arduino_connection = None
@@ -165,20 +218,33 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
 
 # Try to initialize Arduino, but don't let it hang the program
-try:
-    print("Attempting to connect to Arduino...")
-    arduino_result = initialize_arduino()
-    if arduino_result:
-        # Send quick test signals
-        print("Sending test signal to Arduino...")
-        send_signal(CONTROL_PIN, 1.0)  # Test with full brightness
-        time.sleep(0.5)
-        send_signal(CONTROL_PIN, 0.0)  # Turn off
-    else:
-        print("Warning: Could not connect to Arduino. Will try again when needed.")
-except Exception as e:
-    print(f"Error during Arduino initialization: {e}")
-    print("Continuing without Arduino connection...")
+if USE_ARDUINO:
+    try:
+        print("Attempting to connect to Arduino...")
+        arduino_result = initialize_arduino()
+        
+        if arduino_result:
+            print("Arduino connection established successfully.")
+            
+            # Give the Arduino IDE a chance to release the port if it was previously being used for uploads
+            print("Waiting for Arduino to be fully ready...")
+            time.sleep(2.0)
+            
+            # Test servo control
+            print("Testing servo activation...")
+            send_signal("", 0.8, is_servo=True)  # Test servo movement
+        else:
+            print("Warning: Could not connect to Arduino.")
+            print("If the Arduino is connected:")
+            print("1. Check that it's plugged in and recognized by your system")
+            print("2. Make sure the Arduino IDE isn't using the port")
+            print("3. Try unplugging and reconnecting the Arduino")
+            print("4. Or use --no-arduino flag to run without hardware")
+    except Exception as e:
+        print(f"Error during Arduino initialization: {e}")
+        print("Continuing without Arduino connection...")
+else:
+    print("Arduino support disabled via command line. Running in display-only mode.")
 
 with mp_hands.Hands(
     model_complexity=0,
@@ -231,20 +297,31 @@ with mp_hands.Hands(
         should_send_signal = int(current_time * 5) % 2 == 0  # Send updates at reduced rate (every ~0.4 seconds)
         
         # If signal has expired, reset the value to 0.0
-        # This will turn off the LED after the hold duration
         if signal_expired:
             current_signal_value = 0.0
         
         # Visualize the current signal value
         draw_circle(frame, current_signal_value)
         
-        if should_send_signal:
-            send_signal(CONTROL_PIN, current_signal_value)
+        # Only attempt to send signals if we're not in display-only mode
+        if should_send_signal and USE_ARDUINO:
+            # Throttle signal sending to not flood the connection
+            # Send signal to the servo controller if the value exceeds the threshold
+            if current_signal_value > CHOP_THRESHOLD:
+                send_signal("", current_signal_value, is_servo=True)
+                
+                # Only send it once when we exceed the threshold to avoid
+                # triggering the servo repeatedly
+                current_signal_value = 0.0
         
         # Display status messages based on current state
         if current_signal_value > 0:
             cv2.putText(frame, f'Downward movement intensity: {current_signal_value:.2f}', (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            
+            if current_signal_value > CHOP_THRESHOLD:
+                cv2.putText(frame, 'SERVO ACTIVATED!', (20, 200),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 230), 2)
             
             # Show countdown for how long the signal will remain
             if not chop_detected:  # Only show countdown when not actively moving
@@ -252,20 +329,21 @@ with mp_hands.Hands(
                 cv2.putText(frame, f'Signal hold: {time_left:.1f}s', (20, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         else:
-            cv2.putText(frame, 'No downward movement detected - LED OFF', (20, 80),
+            cv2.putText(frame, 'No downward movement detected - Controls OFF', (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         
-        cv2.putText(frame, f'Move your hand DOWNWARD to control LED (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
+        cv2.putText(frame, f'Move your hand DOWNWARD to control servo (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        cv2.putText(frame, 'Downward movement above threshold = LED on for 1 second. Press x to exit.', (20, 160),
+        cv2.putText(frame, 'Downward movement above threshold activates servo. Press x to exit.', (20, 160),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
         cv2.imshow('Gesture Circle', frame.astype(np.uint8))
         if (cv2.waitKey(1) & 0xFF) == ord('x'):
             break
 
-# Turn off the LED and clean up
+# Reset servo to initial position and clean up
 if USE_ARDUINO and arduino_connection is not None and arduino_connection.is_open:
-    send_signal(CONTROL_PIN, 0.0)  # Turn off the LED
+    # Reset servo to initial position (no need for specific value, just below threshold)
+    send_signal("", 0.0, is_servo=True)
     arduino_connection.close()
     print("Arduino connection closed")
 
