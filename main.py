@@ -241,22 +241,26 @@ with mp_hands.Hands(
     min_tracking_confidence=0.5,
 ) as hands:
     while True:
-        # Still capture webcam for hand tracking, but don't use it as background
         ret, webcam_frame = cap.read()
         if not ret:
             break
-        
-        # Create solid background for game
-        frame = np.full((FRAME_HEIGHT, FRAME_WIDTH, 3), BACKGROUND_COLOR, dtype=np.uint8)
-        
-        # Process webcam for hand detection (flipped for mirror effect)
+        # Resize and flip for mirror effect
         webcam_frame = cv2.resize(webcam_frame, (FRAME_WIDTH, FRAME_HEIGHT))
         webcam_frame = cv2.flip(webcam_frame, 1)
-        rgb = cv2.cvtColor(webcam_frame, cv2.COLOR_BGR2RGB)
+        frame = webcam_frame.copy()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         t_now = time.time()
         results = hands.process(rgb)
         if results.multi_hand_landmarks and results.multi_handedness:
             for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                # Draw hand landmarks and connections
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_lms,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style()
+                )
                 anchor_lm = hand_lms.landmark[0]
                 if is_left(handedness):
                     left_anchor.update(anchor_lm, FRAME_WIDTH, FRAME_HEIGHT, t_now)
