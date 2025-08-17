@@ -2,60 +2,89 @@
 Servo myServo; // Create a Servo object
 String incomingCommand; // A string to hold the incoming command
 
+// Define servo position limits
+const int MIN_POS = 1;    // Minimum servo position (degrees, avoid 0 for reliability)
+const int MAX_POS = 89;   // Maximum servo position (degrees, avoid 90 for reliability)
+const int INIT_POS = 1;   // Initial position (degrees)
+
+// Timeout handling
+unsigned long lastCommandTime = 0;
+const unsigned long COMMAND_TIMEOUT = 5000; // 5 seconds timeout
+
+// Serial buffer management
+const int MAX_COMMAND_LENGTH = 10;
+char serialBuffer[MAX_COMMAND_LENGTH];
+int bufferIndex = 0;
+
 void setup() {
   myServo.attach(9); // Attach the servo to digital pin 9
   Serial.begin(9600);
-  myServo.write(90); // Set to initial position
-  Serial.println("Servo control initialized. Send value > 0.5 to activate.");
+  myServo.write(INIT_POS); // Set to initial position
+  Serial.println("Servo control initialized. Send values between 0.0 and 1.0");
+  
+  // Mark current time as the last command time
+  lastCommandTime = millis();
 }
 
 void loop() {
-  // Check if data is available from the serial port
-  if (Serial.available() > 0) {
-    // Read the command string until newline character
-    incomingCommand = Serial.readStringUntil('\n');
+  // Check for timeout - if we haven't received a command in a while, keep the servo in the last position
+  unsigned long currentTime = millis();
+  if (currentTime - lastCommandTime > COMMAND_TIMEOUT) {
+    // No commands for a while, just continue (don't reset servo)
+    // This prevents the servo from twitching if communication is temporarily lost
+  }
+
+  // Process any incoming data efficiently
+  while (Serial.available() > 0) {
+    // Read one character at a time
+    char inChar = (char)Serial.read();
     
-    // Parse the command value
-    float value = incomingCommand.toFloat();
-    
-    // Only activate the servo sequence if the value is > 0.5
-    if (value > 0.5) {
-      runServoSequence();
-      Serial.println("Servo sequence completed");
-    } else {
-      Serial.print("Value ");
-      Serial.print(value);
-      Serial.println(" is below threshold (0.5). No action taken.");
+    // Check for end of command
+    if (inChar == '\n' || inChar == '\r') {
+      // Only process if we have content
+      if (bufferIndex > 0) {
+        // Null-terminate the string
+        serialBuffer[bufferIndex] = '\0';
+        
+        // Parse the command value
+        float value = atof(serialBuffer);
+        
+        // Constrain value to be between 0.0 and 1.0
+        value = constrain(value, 0.0, 1.0);
+        
+        // Calculate servo position (map 0.0-1.0 to servo range)
+        // Convert float 0.0-1.0 to servo range 1-89
+        // Note: We're inverting the mapping direction (using MAX_POS to MIN_POS)
+        // because of how the servo is oriented in your setup
+        int servoPosition = map(int(value * 100), 0, 100, MAX_POS, MIN_POS);
+        
+        // Ensure we stay within safe limits
+        servoPosition = constrain(servoPosition, MIN_POS, MAX_POS);
+        
+        // Set the servo position directly
+        myServo.write(servoPosition);
+        
+        // Log the received value and the servo position (only occasionally to reduce serial traffic)
+        if (random(5) == 0) { // Only log 20% of commands to reduce serial traffic
+          Serial.print("Received: ");
+          Serial.print(value, 2);
+          Serial.print(" -> Servo: ");
+          Serial.println(servoPosition);
+        }
+        
+        // Reset for next command
+        bufferIndex = 0;
+        
+        // Update the last command time
+        lastCommandTime = currentTime;
+      }
+    }
+    // Add character to buffer if not full
+    else if (bufferIndex < MAX_COMMAND_LENGTH - 1) {
+      serialBuffer[bufferIndex++] = inChar;
     }
   }
-}
-
-// Function to run the chopping servo sequence
-void runServoSequence() {
-  int fastDelay = 5;    // Fast movement delay (going down) - was 20
-  int slowDelay = 20;   // Slow movement delay (going up) - was 5
-  int myInitPos = 90;   // Initial position
-  int newPos = myInitPos; // Set new position to initial position
   
-  Serial.println("Starting servo sequence...");
-  myServo.write(myInitPos);   // Move servo to initial position
-  delay(100);
-  
-  // First movement - going down FAST
-  for (int i = 0; i < myInitPos; i++) {
-    newPos = myInitPos - i;
-    myServo.write(newPos);
-    delay(fastDelay); // Fast movement
-  }
-  
-  // Second movement - going up SLOW
-  for (int i = 0; i < myInitPos; i++) {
-    newPos = i;
-    myServo.write(newPos);
-    delay(slowDelay); // Slow movement
-  }
-  
-  // Return to initial position
-  myServo.write(myInitPos);
-  delay(100);
+  // Small delay to prevent CPU hogging
+  delay(1);
 }
