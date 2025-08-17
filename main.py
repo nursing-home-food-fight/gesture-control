@@ -5,14 +5,22 @@ import numpy as np
 import serial
 import time
 import sys
+import mss  # ADDED: For screen capturing
 
 mp_hands: Any = mp.solutions.hands
 mp_drawing: Any = mp.solutions.drawing_utils
 mp_styles: Any = mp.solutions.drawing_styles
 
+# --- NEW: Screen Capture Config ---
+# Define the region of the screen to capture.
+# You will likely need to adjust these values for your screen setup.
+# An easy way to find coordinates is to use a simple screenshot tool that shows pixel coordinates.
+SCREEN_REGION: Final[dict[str, int]] = {'top': 100, 'left': 100, 'width': 1280, 'height': 720}
+
 # --- Config ---
-FRAME_WIDTH: Final[int] = 1280
-FRAME_HEIGHT: Final[int] = 720
+# Frame dimensions are now derived from the screen capture region for consistency
+FRAME_WIDTH: Final[int] = SCREEN_REGION['width']
+FRAME_HEIGHT: Final[int] = SCREEN_REGION['height']
 CIRCLE_COLOR: Final[Tuple[int, int, int]] = (0, 0, 255)   # red
 
 CHOP_THRESHOLD: Final[float] = 0.5  # Minimum vertical movement to be considered a chop
@@ -98,7 +106,7 @@ class HandTracker:
 USE_ARDUINO = "--no-arduino" not in sys.argv
 
 # Try these ports in order - focus on COM4 since it shows "Access is denied" rather than "not found"
-ARDUINO_PORTS = ['COM4']  # Reduced to just the port that seems to exist but might be busy
+ARDUINO_PORTS = ['/dev/cu.usbmodem101']  # Reduced to just the port that seems to exist but might be busy
 BAUD_RATE = 9600
 SERVO_PIN = '9'  # Pin number for servo on Arduino
 arduino_connection = None  # Global variable to hold the Arduino connection
@@ -286,10 +294,10 @@ def detect_vertical_position(hand_lms: Any, prev_hand_positions: list) -> Tuple[
     return movement_detected, position_change
 
 cv2.destroyAllWindows()
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
+# REMOVED: Webcam Initialization
+# cap = cv2.VideoCapture(0)
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
 
 # Try to initialize Arduino, but don't let it hang the program
@@ -337,118 +345,124 @@ with mp_hands.Hands(
     signal_hold_duration = 0.1  # Hold the signal for just 0.1 seconds (much shorter)
     last_signal_time = 0  # Track when we last sent a signal to avoid flooding
     
-    while True:
-        ret, webcam_frame = cap.read()
-        if not ret:
-            break
-        webcam_frame = cv2.resize(webcam_frame, (FRAME_WIDTH, FRAME_HEIGHT))
-        webcam_frame = cv2.flip(webcam_frame, 1)
-        frame = webcam_frame.copy()
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
-        
-        # Check if we should reset the signal after hold duration
-        current_time = time.time()
-        signal_expired = (current_time - last_chop_time) > signal_hold_duration
-        
-        chop_detected = False
-        chop_speed = 0.0
-        
-        # Update hand tracker visibility status
-        hand_tracker.check_visibility()
-        
-        # Process new hand detection
-        if results.multi_hand_landmarks:
-            # Update the tracker with the first hand detected
-            hand_tracker.update(results.multi_hand_landmarks[0])
-        
-        # Get smoothed hand landmarks (could be current or last known position)
-        smooth_hand_lms = hand_tracker.get_landmarks()
-        
-        if smooth_hand_lms:
-            # Draw the smoothed hand landmarks
-            mp_drawing.draw_landmarks(
-                frame,
-                smooth_hand_lms,
-                mp_hands.HAND_CONNECTIONS,
-                mp_styles.get_default_hand_landmarks_style(),
-                mp_styles.get_default_hand_connections_style()
-            )
+    # ADDED: Initialize the screen capture object
+    with mss.mss() as sct:
+        while True:
+            # MODIFIED: Capture from screen instead of camera
+            # Grab the screen data from the defined region
+            sct_img = sct.grab(SCREEN_REGION)
+
+            # Convert the raw BGRA image to a NumPy array
+            webcam_frame = np.array(sct_img)
             
-            # Process hand movement using the smoothed hand landmarks
-            movement_detected, position_change = detect_vertical_position(smooth_hand_lms, prev_hand_positions)
-            if movement_detected:
-                chop_detected = True
-                chop_speed = position_change
-                # Update signal value and reset timer when movement exceeds threshold
-                if position_change > CHOP_THRESHOLD:
-                    current_signal_value = position_change
-                    last_chop_time = current_time
+            # Convert from BGRA to BGR for OpenCV compatibility (discards alpha channel)
+            webcam_frame = cv2.cvtColor(webcam_frame, cv2.COLOR_BGRA2BGR)
             
-            # Add status indicator for smoothing
-            if not hand_tracker.hand_visible:
-                # If using last known position, display indicator
-                cv2.putText(frame, "Using last known hand position", (frame.shape[1] - 350, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-        
-        # If signal has expired, reset the value to 0.0
-        if signal_expired:
-            current_signal_value = 0.0
-        
-        # Visualize the current signal value
-        draw_circle(frame, current_signal_value)
-        
-        # Only attempt to send signals if we're not in display-only mode
-        if USE_ARDUINO and current_signal_value > CHOP_THRESHOLD:
-            # Limit how often we send signals to avoid flooding the Arduino
-            # Only send a new signal if it's been more than 0.5 seconds since the last one
-            if current_time - last_signal_time > 0.5:
-                send_signal("", current_signal_value, is_servo=True)
-                last_signal_time = current_time  # Update the last signal time
-                
-                # Reset the signal immediately after sending to prevent rapid repeats
-                # but keep visual feedback in the UI
-                # current_signal_value = 0.0  # Uncomment to reset signal immediately
-        
-        # Display status messages based on current state
-        if current_signal_value > 0:
-            cv2.putText(frame, f'Downward movement intensity: {current_signal_value:.2f}', (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            # MODIFIED: Flipping is usually for mirroring a webcam and is not needed for screen capture.
+            # webcam_frame = cv2.flip(webcam_frame, 1)
+
+            frame = webcam_frame.copy()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb)
             
-            if current_signal_value > CHOP_THRESHOLD:
-                cv2.putText(frame, 'SERVO ACTIVATED!', (20, 200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 230), 2)
+            # Check if we should reset the signal after hold duration
+            current_time = time.time()
+            signal_expired = (current_time - last_chop_time) > signal_hold_duration
             
-            # Show countdown for how long the signal will remain
-            if not chop_detected:  # Only show countdown when not actively moving
-                time_left = max(0.0, signal_hold_duration - (current_time - last_chop_time))
-                cv2.putText(frame, f'Signal hold: {time_left:.1f}s', (20, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        else:
+            chop_detected = False
+            chop_speed = 0.0
+            
+            # Update hand tracker visibility status
+            hand_tracker.check_visibility()
+            
+            # Process new hand detection
+            if results.multi_hand_landmarks:
+                # Update the tracker with the first hand detected
+                hand_tracker.update(results.multi_hand_landmarks[0])
+            
+            # Get smoothed hand landmarks (could be current or last known position)
+            smooth_hand_lms = hand_tracker.get_landmarks()
+            
             if smooth_hand_lms:
-                status = "Hand detected - Controls ready" if hand_tracker.hand_visible else "Using last known position"
-                cv2.putText(frame, status, (20, 80),
+                # Draw the smoothed hand landmarks
+                mp_drawing.draw_landmarks(
+                    frame,
+                    smooth_hand_lms,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style()
+                )
+                
+                # Process hand movement using the smoothed hand landmarks
+                movement_detected, position_change = detect_vertical_position(smooth_hand_lms, prev_hand_positions)
+                if movement_detected:
+                    chop_detected = True
+                    chop_speed = position_change
+                    # Update signal value and reset timer when movement exceeds threshold
+                    if position_change > CHOP_THRESHOLD:
+                        current_signal_value = position_change
+                        last_chop_time = current_time
+                
+                # Add status indicator for smoothing
+                if not hand_tracker.hand_visible:
+                    # If using last known position, display indicator
+                    cv2.putText(frame, "Using last known hand position", (frame.shape[1] - 350, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            
+            # If signal has expired, reset the value to 0.0
+            if signal_expired:
+                current_signal_value = 0.0
+            
+            # Visualize the current signal value
+            draw_circle(frame, current_signal_value)
+            
+            # Only attempt to send signals if we're not in display-only mode
+            if USE_ARDUINO and current_signal_value > CHOP_THRESHOLD:
+                # Limit how often we send signals to avoid flooding the Arduino
+                # Only send a new signal if it's been more than 0.5 seconds since the last one
+                if current_time - last_signal_time > 0.5:
+                    send_signal("", current_signal_value, is_servo=True)
+                    last_signal_time = current_time  # Update the last signal time
+                    
+            # Display status messages based on current state
+            if current_signal_value > 0:
+                cv2.putText(frame, f'Downward movement intensity: {current_signal_value:.2f}', (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+                
+                if current_signal_value > CHOP_THRESHOLD:
+                    cv2.putText(frame, 'SERVO ACTIVATED!', (20, 200),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 230), 2)
+                
+                # Show countdown for how long the signal will remain
+                if not chop_detected:  # Only show countdown when not actively moving
+                    time_left = max(0.0, signal_hold_duration - (current_time - last_chop_time))
+                    cv2.putText(frame, f'Signal hold: {time_left:.1f}s', (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
             else:
-                cv2.putText(frame, 'No hand detected - Controls OFF', (20, 80),
+                if smooth_hand_lms:
+                    status = "Hand detected - Controls ready" if hand_tracker.hand_visible else "Using last known position"
+                    cv2.putText(frame, status, (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+                else:
+                    cv2.putText(frame, 'No hand detected - Controls OFF', (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            
+            cv2.putText(frame, f'Move your hand DOWNWARD to control servo (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        
-        cv2.putText(frame, f'Move your hand DOWNWARD to control servo (threshold: {CHOP_THRESHOLD:.2f}).', (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        cv2.putText(frame, 'Downward movement above threshold activates servo. Press x to exit.', (20, 160),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-        
-        # Show smoothing information
-        smooth_status = f"Smoothing: {'ON' if USE_SMOOTHING else 'OFF'} (factor: {SMOOTHING_FACTOR:.1f})"
-        timeout_status = f"Hand timeout: {HAND_TIMEOUT:.1f}s"
-        cv2.putText(frame, smooth_status, (20, frame.shape[0] - 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        cv2.putText(frame, timeout_status, (20, frame.shape[0] - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        
-        cv2.imshow('Gesture Circle', frame.astype(np.uint8))
-        if (cv2.waitKey(1) & 0xFF) == ord('x'):
-            break
+            cv2.putText(frame, 'Downward movement above threshold activates servo. Press x to exit.', (20, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            
+            # Show smoothing information
+            smooth_status = f"Smoothing: {'ON' if USE_SMOOTHING else 'OFF'} (factor: {SMOOTHING_FACTOR:.1f})"
+            timeout_status = f"Hand timeout: {HAND_TIMEOUT:.1f}s"
+            cv2.putText(frame, smooth_status, (20, frame.shape[0] - 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.putText(frame, timeout_status, (20, frame.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            
+            cv2.imshow('Gesture Circle', frame.astype(np.uint8))
+            if (cv2.waitKey(1) & 0xFF) == ord('x'):
+                break
 
 # Reset servo to initial position and clean up
 if USE_ARDUINO and arduino_connection is not None and arduino_connection.is_open:
@@ -457,6 +471,7 @@ if USE_ARDUINO and arduino_connection is not None and arduino_connection.is_open
     arduino_connection.close()
     print("Arduino connection closed")
 
-cap.release()
+# REMOVED: No longer using a camera capture object
+# cap.release()
 cv2.destroyAllWindows()
 print('Gesture demo stopped.')
