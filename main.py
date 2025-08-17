@@ -27,7 +27,11 @@ CIRCLE_COLOR: Final[Tuple[int, int, int]] = (0, 0, 255)   # red
 MIN_ANGLE: Final[float] = 0.0  # Minimum angle value for normalization (straight arm)
 MAX_ANGLE: Final[float] = 90.0  # Maximum angle value for normalization (90 degree bend)
 
+# Rapid chop mode configuration
 CHOP_THRESHOLD: Final[float] = 0.5  # Keeping this for backward compatibility
+RAPID_CHOP_SPEED: Final[float] = 0.2  # Seconds per chop cycle (lower = faster)
+RAPID_CHOP_MIN: Final[float] = 0.01  # Minimum servo position in chop mode
+RAPID_CHOP_MAX: Final[float] = 0.99  # Maximum servo position in chop mode
 
 # --- Smoothing Config ---
 SMOOTHING_FACTOR: Final[float] = 0.5  # 0 = no smoothing, 1 = maximum smoothing
@@ -298,6 +302,24 @@ def draw_circle(img: Any, intensity: float = 1.0) -> None:
     
     cv2.circle(img, (w // 2, h // 2), radius, intensity_color, thickness=thickness)
 
+def is_fist(hand_lms: Any) -> bool:
+    """
+    Simple fist detection: check if most fingertips are close to palm.
+    
+    Indices: 0=wrist, 4=thumb_tip, 8=index_tip, 12=middle_tip, 16=ring_tip, 20=pinky_tip
+    
+    Returns: True if a fist gesture is detected, False otherwise
+    """
+    tips = [4, 8, 12, 16, 20]
+    palm = hand_lms.landmark[0]
+    closed = 0
+    for tip_idx in tips:
+        tip = hand_lms.landmark[tip_idx]
+        dist = ((tip.x - palm.x) ** 2 + (tip.y - palm.y) ** 2) ** 0.5
+        if dist < 0.18:  # Threshold for closed fingers
+            closed += 1
+    return closed >= 3  # Consider it a fist if at least 3 fingers are closed
+
 def calculate_hand_angle(hand_lms: Any) -> float:
     """
     Calculate the angle between the wrist, elbow and shoulder.
@@ -412,6 +434,11 @@ with mp_hands.Hands(
     interpolation_start_value = 0.0
     interpolation_target_value = 0.0
     
+    # Rapid chop mode state
+    rapid_chop_mode = False
+    rapid_chop_start_time = 0.0
+    rapid_chop_direction = 1  # 1 for increasing, -1 for decreasing
+    
     # ADDED: Initialize the screen capture object
     with mss.mss() as sct:
         # Add a safety counter and last_error_time to prevent error spam
@@ -477,31 +504,66 @@ with mp_hands.Hands(
                     mp_styles.get_default_hand_connections_style()
                 )
                 
-                # Calculate the hand angle using the smoothed landmarks
-                hand_angle = detect_hand_angle(smooth_hand_lms)
-                
-                # Update the detected angle value
-                interpolation_target_value = hand_angle
-                
-                # Calculate where we are in the interpolation between samples
-                time_since_last_sample = current_time - last_sample_time
-                
-                # Prevent division by zero or negative values
-                if SAMPLE_INTERVAL > 0:
-                    progress = min(1.0, max(0.0, time_since_last_sample / SAMPLE_INTERVAL))
+                # Check for fist gesture to toggle rapid chop mode
+                if is_fist(smooth_hand_lms):
+                    if not rapid_chop_mode:
+                        # Enter rapid chop mode
+                        rapid_chop_mode = True
+                        rapid_chop_start_time = current_time
+                        print("Entered RAPID CHOP mode!")
                 else:
-                    progress = 1.0
+                    if rapid_chop_mode:
+                        # Exit rapid chop mode
+                        rapid_chop_mode = False
+                        print("Exited RAPID CHOP mode.")
                 
-                # Apply linear interpolation between the last sent value and the target
-                if USE_INTERPOLATION:
-                    # Ensure all values are valid floats
-                    try:
-                        current_signal_value = interpolation_start_value + (interpolation_target_value - interpolation_start_value) * progress
-                    except Exception as e:
-                        print(f"Interpolation error: {e}, using target value directly")
+                if not rapid_chop_mode:
+                    # Normal mode: Calculate hand angle
+                    hand_angle = detect_hand_angle(smooth_hand_lms)
+                    
+                    # Update the detected angle value
+                    interpolation_target_value = hand_angle
+                
+                # Process based on current mode
+                if rapid_chop_mode:
+                    # In rapid chop mode, oscillate between min and max values
+                    elapsed_time = current_time - rapid_chop_start_time
+                    cycle_position = (elapsed_time % RAPID_CHOP_SPEED) / RAPID_CHOP_SPEED
+                    
+                    # Calculate current position in chop cycle (triangular wave)
+                    if cycle_position < 0.5:
+                        # Moving up (0->1)
+                        normalized_position = cycle_position * 2  # 0 to 1
+                    else:
+                        # Moving down (1->0)
+                        normalized_position = 2 - (cycle_position * 2)  # 1 to 0
+                    
+                    # Set the current signal value based on chop cycle
+                    current_signal_value = RAPID_CHOP_MIN + normalized_position * (RAPID_CHOP_MAX - RAPID_CHOP_MIN)
+                    
+                    # Also update the target/interpolation values for consistency
+                    interpolation_target_value = current_signal_value
+                    interpolation_start_value = current_signal_value
+                else:
+                    # Normal mode: Calculate where we are in the interpolation between samples
+                    time_since_last_sample = current_time - last_sample_time
+                    
+                    # Prevent division by zero or negative values
+                    if SAMPLE_INTERVAL > 0:
+                        progress = min(1.0, max(0.0, time_since_last_sample / SAMPLE_INTERVAL))
+                    else:
+                        progress = 1.0
+                    
+                    # Apply linear interpolation between the last sent value and the target
+                    if USE_INTERPOLATION:
+                        # Ensure all values are valid floats
+                        try:
+                            current_signal_value = interpolation_start_value + (interpolation_target_value - interpolation_start_value) * progress
+                        except Exception as e:
+                            print(f"Interpolation error: {e}, using target value directly")
+                            current_signal_value = interpolation_target_value
+                    else:
                         current_signal_value = interpolation_target_value
-                else:
-                    current_signal_value = interpolation_target_value
                 
                 # Print current interpolated value less frequently to avoid console spam
                 # Using integer division to avoid floating-point modulo issues
@@ -522,7 +584,8 @@ with mp_hands.Hands(
             draw_circle(frame, current_signal_value)
             
             # Check if it's time for a new sample
-            if current_time >= next_sample_time:
+            # In rapid chop mode, we always send samples on every cycle
+            if current_time >= next_sample_time or (rapid_chop_mode and smooth_hand_lms):
                 # Save current value as the start point for the next interpolation
                 interpolation_start_value = current_signal_value
                 
@@ -560,20 +623,31 @@ with mp_hands.Hands(
                 cv2.putText(frame, f'Hand angle value: {current_signal_value:.2f}', (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
                 
-                status = "Hand detected - Controls active" if hand_tracker.hand_visible else "Using last known position"
-                cv2.putText(frame, status, (20, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+                if rapid_chop_mode:
+                    status = "RAPID CHOP MODE ACTIVE! - Make open hand to exit"
+                    cv2.putText(frame, status, (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)  # Red text for rapid chop
+                else:
+                    status = "Hand detected - Controls active" if hand_tracker.hand_visible else "Using last known position"
+                    cv2.putText(frame, status, (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
                         
                 # Show servo activation message
-                cv2.putText(frame, 'Signal sent to servo (or printed in console)', (20, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 230), 2)
+                if rapid_chop_mode:
+                    cv2.putText(frame, 'RAPID CHOP MODE: Servo oscillating at high speed!', (20, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)  # Red text
+                else:
+                    cv2.putText(frame, 'Signal sent to servo (or printed in console)', (20, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 230), 2)
             else:
                 cv2.putText(frame, 'No hand detected - Controls OFF', (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
             
             cv2.putText(frame, 'Change hand angle to control servo (0 = straight, 1 = bent 90°).', (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
-            cv2.putText(frame, f'Signal sent at {SAMPLE_RATE_HZ:.1f}Hz with interpolation. Press x to exit.', (20, 200),
+            cv2.putText(frame, 'Make a fist to activate rapid chop mode! Open hand to exit chop mode.', (20, 200),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
+            cv2.putText(frame, f'Signal sent at {SAMPLE_RATE_HZ:.1f}Hz with interpolation. Press x to exit.', (20, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
             
             # Show hand tracking information
@@ -586,7 +660,10 @@ with mp_hands.Hands(
             
             # Add status about the signal being sent
             if smooth_hand_lms:
-                signal_status = f"Signal: Current={current_signal_value:.2f}, Target={interpolation_target_value:.2f}, Last Sent={last_sent_value:.2f}"
+                if rapid_chop_mode:
+                    signal_status = f"RAPID CHOP MODE: Signal={current_signal_value:.2f}, Speed={1.0/RAPID_CHOP_SPEED:.1f}Hz"
+                else:
+                    signal_status = f"Signal: Current={current_signal_value:.2f}, Target={interpolation_target_value:.2f}, Last Sent={last_sent_value:.2f}"
             else:
                 signal_status = "No hand detected - no signals sent"
             
