@@ -1,13 +1,8 @@
-from numpy import ndarray
+from frame_handler import process_frame_with_hands
 from video import run_video
 
-def handle_frame_test(frame: ndarray):
-    # Process the frame (this is just a placeholder)
-    print("Processing frame:", frame.shape)
-
 def main():
-    print("Hello, World!")
-    run_video([handle_frame_test])
+    run_video([process_frame_with_hands])
 
 if __name__ == "__main__":
     main()
